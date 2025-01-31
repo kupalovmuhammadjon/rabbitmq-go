@@ -1,6 +1,7 @@
 package rabbitmq
 
 import (
+	"bytes"
 	"encoding/json"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -177,7 +178,10 @@ func (r *rabbitmq) ConsumeMessages(queueName string, handler func([]byte)) error
 	// Start a goroutine to handle incoming messages.
 	go func() {
 		for msg := range msgs {
-			handler(msg.Body) // Call the handler function for each message.
+			// to remove Byte Order Marks (BOM) at the start of the file or request body in order to avoid looking for ï error from unmarshal
+
+			body := bytes.TrimPrefix(msg.Body, []byte{0xEF, 0xBB, 0xBF})
+			handler(body) // Call the handler function for each message.
 		}
 	}()
 
