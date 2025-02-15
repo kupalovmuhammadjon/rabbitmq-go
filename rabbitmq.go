@@ -2,7 +2,12 @@ package rabbitmq
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"log"
+	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -16,7 +21,7 @@ type RabbitMQ interface {
 	PublishMessage(queueName, exchangeName string, message interface{}) error
 
 	// ConsumeMessages starts consuming messages from a queue and invokes the provided handler function for each message.
-	ConsumeMessages(queueName string, handler func([]byte)) error
+	ConsumeMessages(ctx context.Context, queueName string, handler func([]byte) error) error
 
 	// DeclareQueue declares a RabbitMQ queue with the provided configuration.
 	DeclareQueue(queueName string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) error
@@ -30,8 +35,11 @@ rabbitmq is the concrete implementation of the RabbitMQ interface.
 It maintains the connection and channel to RabbitMQ.
 */
 type rabbitmq struct {
-	conn    *amqp.Connection // Connection to RabbitMQ.
-	channel *amqp.Channel    // Channel for communication with RabbitMQ.
+	conn    *amqp.Connection
+	channel *amqp.Channel
+	queues  map[string]amqp.Table
+	mu      sync.Mutex
+	url     string
 }
 
 /*
@@ -52,6 +60,8 @@ func NewRabbitMQ(url string) (RabbitMQ, error) {
 	return &rabbitmq{
 		conn:    conn,
 		channel: ch,
+		queues:  make(map[string]amqp.Table),
+		url:     url,
 	}, nil
 }
 
@@ -81,7 +91,7 @@ func connectToRabbitMQ(url string) (*amqp.Connection, *amqp.Channel, error) {
 }
 
 /*
-DeclareQueue declares a RabbitMQ queue with the specified configuration.
+DeclareQueue declares a RabbitMQ queue with the specified configuration and stores its details.
 
 	Parameters:
 	- queueName: Name of the queue.
@@ -94,17 +104,15 @@ DeclareQueue declares a RabbitMQ queue with the specified configuration.
 	- error: Error, if any, during the queue declaration.
 */
 func (r *rabbitmq) DeclareQueue(queueName string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) error {
-	_, err := r.channel.QueueDeclare(
-		queueName,  // name
-		durable,    // durable
-		autoDelete, // auto-delete
-		exclusive,  // exclusive
-		noWait,     // no-wait
-		args,       // arguments
-	)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	_, err := r.channel.QueueDeclare(queueName, durable, autoDelete, exclusive, noWait, args)
 	if err != nil {
 		return err
 	}
+
+	r.queues[queueName] = args
 	return nil
 }
 
@@ -134,75 +142,135 @@ func (r *rabbitmq) PublishMessage(queueName, exchangeName string, message interf
 		}
 	}
 
-	// Publish the message to the queue
-	err = r.channel.Publish(
-		exchangeName, // exchange
-		queueName,    // routing key
-		false,        // mandatory
-		false,        // immediate
-		amqp.Publishing{
-			ContentType: "application/json", // Set content type to JSON
-			Body:        body,               // Message body
-		},
-	)
-	if err != nil {
-		return err
+	for attempt := 1; attempt <= 3; attempt++ {
+		r.mu.Lock()
+		if r.channel == nil {
+			r.mu.Unlock()
+			return fmt.Errorf("RabbitMQ channel is closed")
+		}
+		err = r.channel.Publish(exchangeName, queueName, false, false, amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		})
+		r.mu.Unlock()
+
+		if err == nil {
+			return nil
+		}
+
+		log.Printf("Publish failed (attempt %d): %v", attempt, err)
+
+		if r.isConnectionClosed() {
+			log.Println("Reconnecting before retrying publish...")
+			r.reconnect()
+		}
+
+		time.Sleep(time.Duration(attempt) * time.Second)
 	}
 
-	return nil
+	return fmt.Errorf("failed to publish message after retries: %w", err)
+}
+
+func (r *rabbitmq) isConnectionClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.conn == nil || r.conn.IsClosed() || r.channel == nil
 }
 
 /*
-ConsumeMessages starts consuming messages from a queue and invokes the provided handler function for each message.
+ConsumeMessages continuously consumes messages from a queue.
 
 	Parameters:
+	- ctx: Context for cancellation.
 	- queueName: Name of the queue to consume from.
 	- handler: A function to process the message body.
 	Returns:
-	- error: Error, if any, during message consumption setup.
+	- error: Error, if the queue is not declared.
 */
-func (r *rabbitmq) ConsumeMessages(queueName string, handler func([]byte)) error {
-	msgs, err := r.channel.Consume(
-		queueName, // queue
-		"",        // consumer
-		true,      // auto-ack
-		false,     // exclusive
-		false,     // no-local
-		false,     // no-wait
-		nil,       // args
-	)
-	if err != nil {
-		return err
+func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, handler func([]byte) error) error {
+	if _, exists := r.queues[queueName]; !exists {
+		return fmt.Errorf("queue %s not declared", queueName)
 	}
 
-	// Start a goroutine to handle incoming messages.
-	go func() {
-		for msg := range msgs {
-			// to remove Byte Order Marks (BOM) at the start of the file or request body in order to avoid looking for ï error from unmarshal
-
-			body := bytes.TrimPrefix(msg.Body, []byte{0xEF, 0xBB, 0xBF})
-			handler(body) // Call the handler function for each message.
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Stopping consumer for queue: %s", queueName)
+			return nil
+		default:
+			if err := r.consume(queueName, handler); err != nil {
+				r.reconnect()
+				time.Sleep(1 * time.Second)
+			}
 		}
-	}()
-
-	return nil
+	}
 }
 
 /*
-Close closes the RabbitMQ channel and connection.
+consume processes messages from a queue.
+
+	Parameters:
+	- queueName: Name of the queue to consume from.
+	- handler: Function to process each message.
+	Returns:
+	- error: If consuming fails.
+*/
+func (r *rabbitmq) consume(queueName string, handler func([]byte) error) error {
+	r.mu.Lock()
+	msgs, err := r.channel.Consume(queueName, "", false, false, false, false, nil)
+	r.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("failed to start consuming messages: %w", err)
+	}
+
+	for msg := range msgs {
+		body := bytes.TrimPrefix(msg.Body, []byte{0xEF, 0xBB, 0xBF})
+		if err := handler(body); err != nil {
+			msg.Nack(false, true)
+		} else {
+			msg.Ack(false)
+		}
+	}
+
+	return fmt.Errorf("message channel closed, reconnecting")
+}
+
+/*
+reconnect attempts to re-establish the connection and channel to RabbitMQ.
+It also redeclares previously declared queues.
+*/
+func (r *rabbitmq) reconnect() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for attempts := 1; ; attempts++ {
+		log.Println("Attempting to reconnect to RabbitMQ...")
+		conn, ch, err := connectToRabbitMQ(r.url)
+		if err == nil {
+			r.conn = conn
+			r.channel = ch
+			for queue, args := range r.queues {
+				_, _ = r.channel.QueueDeclare(queue, true, false, false, false, args)
+			}
+			log.Println("Reconnected to RabbitMQ successfully")
+			return
+		}
+
+		log.Printf("Reconnection attempt %d failed: %v", attempts, err)
+		time.Sleep(time.Duration(attempts) * time.Second)
+	}
+}
+
+/*
+Close closes the RabbitMQ connection and channel.
 Returns:
-- error: Error, if any, during closure of the channel or connection.
+- error: If closing fails.
 */
 func (r *rabbitmq) Close() error {
-	// Close the channel.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err := r.channel.Close(); err != nil {
 		return err
 	}
-
-	// Close the connection.
-	if err := r.conn.Close(); err != nil {
-		return err
-	}
-
-	return nil
+	return r.conn.Close()
 }
