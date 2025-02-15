@@ -4,12 +4,22 @@ A lightweight, easy-to-use Go client library for interacting with RabbitMQ. This
 
 ---
 
+## What's New
+
+### v1.0.5 (Latest Release)
+- **Automatic Reconnection**: The client now automatically detects and recovers from connection failures.
+- **Custom Acknowledgments**: Fine-grained control over message acknowledgments for better reliability.
+- **Improved Error Handling**: More robust error messages and retry mechanisms.
+
+---
+
 ## Features
 
 - **Publish Messages**: Send messages to queues or exchanges with support for JSON, strings, or raw bytes.
 - **Consume Messages**: Listen to queues and process incoming messages with a handler function.
 - **Queue Management**: Declare queues with configurable parameters (durability, auto-delete, exclusivity, etc.).
-- **Connection Handling**: Automatically manage RabbitMQ connections and channels.
+- **Automatic Reconnection**: Ensures reliable message delivery in case of connection failures.
+- **Custom Acknowledgments**: Provides manual and automatic acknowledgment handling.
 - **BOM Handling**: Safely process messages with Byte Order Marks (BOM) removed automatically.
 - **Thread-Safe**: Designed for concurrent use in production environments.
 
@@ -105,25 +115,6 @@ err := client.ConsumeMessages("orders", func(body []byte) {
 	}
 	fmt.Printf("Processing order: %s ($%.2f)\n", order.ID, order.Total)
 })
-```
-
-### Advanced: Deferred Processing
-Use goroutines and channels for asynchronous handling:
-
-```go
-msgChan := make(chan []byte)
-
-// Start consumer
-err := client.ConsumeMessages("tasks", func(body []byte) {
-	msgChan <- body
-})
-
-// Process messages concurrently
-go func() {
-	for body := range msgChan {
-		fmt.Printf("Received task: %s\n", string(body))
-	}
-}()
 ```
 
 ---
