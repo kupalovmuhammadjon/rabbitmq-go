@@ -1,11 +1,15 @@
 package main
 
 import (
+	"time"
+
 	"github.com/kupalovmuhammadjon/rabbitmq-go"
+	"github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
-	rabbitMq, err := rabbitmq.NewRabbitMQ("amqp://guest:guest@localhost:5672/")
+	rabbitMq, err := rabbitmq.NewRabbitMQ("amqp://guest:guest@localhost:5672/", &amqp091.Config{
+		Heartbeat: 5 * time.Minute})
 	if err != nil {
 		panic(err)
 	}
