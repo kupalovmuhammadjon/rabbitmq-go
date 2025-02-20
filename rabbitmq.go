@@ -69,9 +69,17 @@ type rabbitmq struct {
 	conn    *amqp.Connection
 	channel *amqp.Channel
 	config  *amqp.Config
-	queues  map[string]amqp.Table
+	queues  map[string]queueConfig
 	mu      sync.Mutex
 	url     string
+}
+
+type queueConfig struct {
+	Durable    bool
+	AutoDelete bool
+	Exclusive  bool
+	NoWait     bool
+	Arguments  amqp.Table
 }
 
 /*
@@ -93,7 +101,7 @@ func NewRabbitMQ(url string, config *amqp.Config) (RabbitMQ, error) {
 		conn:    conn,
 		channel: ch,
 		config:  config,
-		queues:  make(map[string]amqp.Table),
+		queues:  make(map[string]queueConfig),
 		url:     url,
 	}
 
@@ -139,7 +147,13 @@ func (r *rabbitmq) DeclareQueue(queueName string, durable, autoDelete, exclusive
 		return err
 	}
 
-	r.queues[queueName] = args
+	r.queues[queueName] = queueConfig{
+		Durable:    durable,
+		AutoDelete: autoDelete,
+		Exclusive:  exclusive,
+		NoWait:     noWait,
+		Arguments:  args,
+	}
 	return nil
 }
 
@@ -267,8 +281,8 @@ func (r *rabbitmq) reconnect() {
 		if err == nil {
 			r.conn = conn
 			r.channel = ch
-			for queue, args := range r.queues {
-				_, err = r.channel.QueueDeclare(queue, true, false, false, false, args)
+			for queue, cfg := range r.queues {
+				_, err = r.channel.QueueDeclare(queue, cfg.Durable, cfg.AutoDelete, cfg.Exclusive, cfg.NoWait, cfg.Arguments)
 				if err != nil {
 					log.Printf("Failed to redeclare queue %s: %v", queue, err)
 				}
