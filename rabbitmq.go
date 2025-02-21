@@ -40,7 +40,7 @@ type RabbitMQ interface {
 			Returns:
 			- error: Error, if the queue is not declared.
 	*/
-	ConsumeMessages(ctx context.Context, queueName string, handler func([]byte) error) error
+	ConsumeMessages(ctx context.Context, queueName string, prefetch int, handler func([]byte) error) error
 
 	/*
 		DeclareQueue declares a RabbitMQ queue with the specified configuration and stores its details.
@@ -205,7 +205,18 @@ func (r *rabbitmq) isConnectionClosed() bool {
 	return r.conn == nil || r.conn.IsClosed() || r.channel == nil
 }
 
-func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, handler func([]byte) error) error {
+/*
+ConsumeMessages continuously consumes messages from a queue with a configurable prefetch limit.
+
+	Parameters:
+	- ctx: Context for cancellation.
+	- queueName: Name of the queue to consume from.
+	- prefetch: The number of messages to prefetch (QoS setting) for this consumer.
+	- handler: A function to process the message body.
+	Returns:
+	- error: Error, if the queue is not declared.
+*/
+func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, prefetch int, handler func([]byte) error) error {
 	if _, exists := r.queues[queueName]; !exists {
 		return fmt.Errorf("queue %s not declared", queueName)
 	}
@@ -216,7 +227,7 @@ func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, handle
 			log.Printf("Stopping consumer for queue: %s", queueName)
 			return nil
 		default:
-			if err := r.consume(queueName, handler); err != nil {
+			if err := r.consume(queueName, prefetch, handler); err != nil {
 				r.reconnect()
 				time.Sleep(1 * time.Second)
 			}
@@ -225,16 +236,23 @@ func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, handle
 }
 
 /*
-consume processes messages from a queue.
+consume processes messages from a queue, applying the QoS settings as specified.
 
 	Parameters:
 	- queueName: Name of the queue to consume from.
+	- prefetch: The number of messages to prefetch (QoS setting) for this consumer.
 	- handler: Function to process each message.
 	Returns:
 	- error: If consuming fails.
 */
-func (r *rabbitmq) consume(queueName string, handler func([]byte) error) error {
+func (r *rabbitmq) consume(queueName string, prefetch int, handler func([]byte) error) error {
 	r.mu.Lock()
+	// Set QoS: Limit unacknowledged messages to the provided prefetch value for this consumer.
+	if err := r.channel.Qos(prefetch, 0, false); err != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("failed to set QoS: %w", err)
+	}
+
 	msgs, err := r.channel.Consume(queueName, "", false, false, false, false, nil)
 	r.mu.Unlock()
 	if err != nil {
@@ -252,7 +270,6 @@ func (r *rabbitmq) consume(queueName string, handler func([]byte) error) error {
 
 	return fmt.Errorf("message channel closed, reconnecting")
 }
-
 func (r *rabbitmq) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
