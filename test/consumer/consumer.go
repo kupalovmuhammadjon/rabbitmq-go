@@ -21,9 +21,8 @@ func main() {
 		panic(err)
 	}
 
-	if err := rabbitMq.ConsumeMessages(context.Background(), "test", 3, func(body []byte) error {
+	if err := rabbitMq.ConsumeMessages(context.Background(), "test", 3, 100, 30, func(body []byte) error {
 		fmt.Printf("Received message: %s\n", string(body))
-		time.Sleep(5 * time.Second)
 		return nil
 	}); err != nil {
 		panic(err)
