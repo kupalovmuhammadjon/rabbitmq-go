@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"time"
 
@@ -31,16 +32,19 @@ type RabbitMQ interface {
 	PublishMessage(queueName, exchangeName string, message interface{}) error
 
 	/*
-		ConsumeMessages continuously consumes messages from a queue.
+		ConsumeMessages continuously consumes messages from a queue with a configurable prefetch limit and memory-based pausing.
 
 			Parameters:
 			- ctx: Context for cancellation.
 			- queueName: Name of the queue to consume from.
+			- prefetch: The number of messages to prefetch (QoS setting) for this consumer.
+			- memoryLimit: The memory threshold (in MB) for the process. If the process's memory usage exceeds this limit, consumption will pause.
+			- pause: The duration (in seconds) to pause consumption when memory usage exceeds the threshold.
 			- handler: A function to process the message body.
 			Returns:
-			- error: Error, if the queue is not declared.
+			- error: An error if the queue is not declared or if consumption fails.
 	*/
-	ConsumeMessages(ctx context.Context, queueName string, prefetch int, handler func([]byte) error) error
+	ConsumeMessages(ctx context.Context, queueName string, prefetch int, memoryLimit int, pause int, handler func([]byte) error) error
 
 	/*
 		DeclareQueue declares a RabbitMQ queue with the specified configuration and stores its details.
@@ -206,22 +210,26 @@ func (r *rabbitmq) isConnectionClosed() bool {
 }
 
 /*
-ConsumeMessages continuously consumes messages from a queue with a configurable prefetch limit.
+ConsumeMessages continuously consumes messages from a queue with a configurable prefetch limit and memory-based pausing.
 
 	Parameters:
 	- ctx: Context for cancellation.
 	- queueName: Name of the queue to consume from.
 	- prefetch: The number of messages to prefetch (QoS setting) for this consumer.
+	- memoryLimit: The memory threshold (in MB) for the process. If the process's memory usage exceeds this limit, consumption will pause. memoryLimit=0 feauture will not work
+	- pause: The duration (in seconds) to pause consumption when memory usage exceeds the threshold.
 	- handler: A function to process the message body.
 	Returns:
-	- error: Error, if the queue is not declared.
+	- error: An error if the queue is not declared or if consumption fails.
 */
-func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, prefetch int, handler func([]byte) error) error {
+func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, prefetch int, memoryLimit int, pause int, handler func([]byte) error) error {
 	if _, exists := r.queues[queueName]; !exists {
 		return fmt.Errorf("queue %s not declared", queueName)
 	}
 
 	for {
+		var m runtime.MemStats
+
 		select {
 		case <-ctx.Done():
 			log.Printf("Stopping consumer for queue: %s", queueName)
@@ -230,6 +238,12 @@ func (r *rabbitmq) ConsumeMessages(ctx context.Context, queueName string, prefet
 			if err := r.consume(queueName, prefetch, handler); err != nil {
 				r.reconnect()
 				time.Sleep(1 * time.Second)
+			}
+			runtime.ReadMemStats(&m)
+
+			if memoryLimit != 0 && m.Sys > uint64(memoryLimit)*1024*1024 { // 500 MB threshold
+				log.Printf("Memory usage is high (over %d MB). Attempting to free memory.\n", memoryLimit)
+				time.Sleep(time.Duration(pause) * time.Second)
 			}
 		}
 	}
